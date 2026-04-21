@@ -42,6 +42,52 @@ _legacy_callback_registered = False
 session_middleware = Middleware(MCPSessionMiddleware)
 
 
+class MCPPathAliasMiddleware:
+    """Alias /mcp-<suffix> to /mcp transparently.
+
+    Lets a single MCP server be reached at multiple URLs (e.g. /mcp-personal,
+    /mcp-work) so clients that key OAuth state off the URL (Claude Desktop)
+    treat them as distinct servers while they all hit the same backend.
+
+    Also rewrites /.well-known/oauth-protected-resource/mcp-<suffix> to the
+    canonical /.well-known/oauth-protected-resource/mcp so RFC 9728 discovery
+    from the aliased URL returns the same protected-resource metadata.
+    """
+
+    def __init__(self, app, canonical_path: str = "/mcp"):
+        self.app = app
+        self.canonical_path = canonical_path
+        self._alias_prefix = f"{canonical_path}-"
+        self._well_known = "/.well-known/oauth-protected-resource"
+        self._well_known_alias_prefix = f"{self._well_known}/mcp-"
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        new_path: Optional[str] = None
+
+        if path == self.canonical_path or path.startswith(f"{self.canonical_path}/"):
+            pass
+        elif path.startswith(self._alias_prefix):
+            new_path = self.canonical_path
+        elif path.startswith(self._well_known_alias_prefix):
+            new_path = f"{self._well_known}/mcp"
+
+        if new_path is not None:
+            scope = dict(scope)
+            scope["path"] = new_path
+            root_path = scope.get("root_path", "") or ""
+            scope["raw_path"] = (root_path + new_path).encode("ascii")
+
+        await self.app(scope, receive, send)
+
+
+mcp_path_alias_middleware = Middleware(MCPPathAliasMiddleware)
+
+
 class WellKnownCacheControlMiddleware:
     """Force no-cache headers for OAuth well-known discovery endpoints."""
 
@@ -90,14 +136,18 @@ class SecureFastMCP(FastMCP):
         app = super().http_app(**kwargs)
 
         # Add middleware in order (first added = outermost layer)
-        app.user_middleware.insert(0, well_known_cache_control_middleware)
+        # Path alias must be outermost so rewritten path is visible to all others.
+        app.user_middleware.insert(0, mcp_path_alias_middleware)
+        app.user_middleware.insert(1, well_known_cache_control_middleware)
 
         # Session Management - extracts session info for MCP context
-        app.user_middleware.insert(1, session_middleware)
+        app.user_middleware.insert(2, session_middleware)
 
         # Rebuild middleware stack
         app.middleware_stack = app.build_middleware_stack()
-        logger.info("Added middleware stack: WellKnownCacheControl, Session Management")
+        logger.info(
+            "Added middleware stack: MCPPathAlias, WellKnownCacheControl, Session Management"
+        )
         return app
 
     async def list_tools(self, *, run_middleware: bool = True):
